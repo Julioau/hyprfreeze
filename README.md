@@ -17,6 +17,7 @@ https://github.com/Zerodya/hyprfreeze/assets/73220426/541318e2-441a-485a-91c5-f5
 - `psmisc` contains 'pstree' which is required to list child processes
 ### Optional
 - [`hyprprop`](https://github.com/vilari-mickopf/hyprprop) to get the pid of a window by selecting it with your mouse
+- `socat` for the --watch mode functionality
 
 ## Installation
 ### Arch Linux
@@ -60,7 +61,9 @@ bind = , PAUSE, exec, hyprfreeze -a
 -a, --active          toggle suspend by active window
 -p, --pid             toggle suspend by process id
 -n, --name            toggle suspend by process name/command
+-T, --title           toggle suspend by window title (regex)
 -r, --prop            toggle suspend by clicking on window (hyprprop must be installed)
+-w, --watch           continuously watch the window: pause when unfocused, resume when focused
 
 -s, --silent          don't send notification
 -t, --notif-timeout   notification timeout in milliseconds (default 5000)
@@ -73,6 +76,12 @@ bind = , PAUSE, exec, hyprfreeze -a
 ```bash
 # Pause game by process name
 hyprfreeze -n eldenring.exe
+
+# Watch the active window (auto-pause when unfocused)
+hyprfreeze -a -w
+
+# Watch a window by title
+hyprfreeze --title "YouTube" --watch
 ```
 
 ## Caveats

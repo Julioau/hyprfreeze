@@ -12,7 +12,9 @@ Options:
   -a, --active          toggle suspend by active window
   -p, --pid             toggle suspend by process id
   -n, --name            toggle suspend by process name/command
+  -T, --title           toggle suspend by window title (regex)
   -r, --prop            toggle suspend by clicking on window (hyprprop must be installed)
+  -w, --watch           continuously watch the window: pause when unfocused, resume when focused
 
   -s, --silent          don't send notification
   -t, --notif-timeout   notification timeout in milliseconds (default 5000)
@@ -69,16 +71,9 @@ function releaseMouseCapture() {
   fi
 }
 
-function toggleFreeze() {
-  # Skip this function if --dry-run flag was provided
-  if [[ $DRYRUN == "1" ]]; then return 0; fi
-
+function getPids() {
   # Get pids of process tree
   PIDS=$(pstree -p "$PID" | grep -oP '\(\K[^\)]+')
-
-  # Format PIDs for display (comma-separated)
-  PIDS_DISPLAY=$(echo "$PIDS" | tr '\n' ',' | sed 's/,$//')
-  debugPrint "PIDs: $PIDS_DISPLAY"
 
   # Prevent suspending itself
   local pid_of_script=$$
@@ -86,20 +81,91 @@ function toggleFreeze() {
     echo "You are trying to suspend the hyprfreeze process."
     exit 1
   fi
+}
+
+function suspendProcess() {
+  if [[ $DRYRUN == "1" ]]; then return 0; fi
+  getPids
+  
+  # Before suspending, release mouse capture for XWayland windows
+  # In watch mode, we might not need this if focus is already lost, but safe to keep.
+  releaseMouseCapture
+  
+  debugPrint "Suspending processes..."
+  # shellcheck disable=SC2086
+  kill -STOP $PIDS 2>/dev/null && echo "Suspended $(ps -p "$PID" -o comm= 2>/dev/null) (PID $PID)"
+}
+
+function resumeProcess() {
+  if [[ $DRYRUN == "1" ]]; then return 0; fi
+  getPids
+  
+  debugPrint "Resuming processes..."
+  # shellcheck disable=SC2086
+  kill -CONT $PIDS 2>/dev/null && echo "Resumed $(ps -p "$PID" -o comm= 2>/dev/null) (PID $PID)"
+}
+
+function toggleFreeze() {
+  # Skip this function if --dry-run flag was provided
+  # (Handled inside suspend/resume but keeping check for clarity if needed)
+  if [[ $DRYRUN == "1" ]]; then return 0; fi
+
+  getPids
+  # Format PIDs for display (comma-separated)
+  PIDS_DISPLAY=$(echo "$PIDS" | tr '\n' ',' | sed 's/,$//')
+  debugPrint "PIDs: $PIDS_DISPLAY"
 
   # Suspend or resume processes
   if [[ "$(ps -o state= "$PID")" == T ]]; then
-    debugPrint "Resuming processes..."
-    # shellcheck disable=SC2086
-    kill -CONT $PIDS 2>/dev/null && echo "Resumed $(ps -p "$PID" -o comm= 2>/dev/null) (PID $PID)" || exit 1
+    resumeProcess || exit 1
   else
-    # Before suspending, release mouse capture for XWayland windows
-    releaseMouseCapture
-    
-    debugPrint "Suspending processes..."
-    # shellcheck disable=SC2086
-    kill -STOP $PIDS 2>/dev/null && echo "Suspended $(ps -p "$PID" -o comm= 2>/dev/null) (PID $PID)" || exit 1
+    suspendProcess || exit 1
   fi
+}
+
+function watchFreeze() {
+  echo "Watching PID $PID for focus changes... Press Ctrl+C to stop."
+  
+  # Ensure process is resumed when script is terminated
+  trap 'echo; echo "Stopping watch mode. Resuming process..."; resumeProcess; exit 0' SIGINT SIGTERM
+  
+  # Initial check
+  local active_pid
+  active_pid=$(hyprctl activewindow -j | jq '.pid')
+  
+  # Determine initial state
+  if [[ "$active_pid" == "$PID" ]] || pstree -p "$PID" | grep -q "($active_pid)"; then
+      if [[ "$(ps -o state= "$PID")" == T ]]; then resumeProcess; fi
+  else
+      if [[ "$(ps -o state= "$PID")" != T ]]; then suspendProcess; fi
+  fi
+  
+  listen_socket | while read -r line; do
+    if [[ "$line" == activewindow\>\>* ]]; then
+      active_pid=$(hyprctl activewindow -j | jq '.pid')
+      
+      local is_target=0
+      if [[ "$active_pid" == "$PID" ]]; then
+          is_target=1
+      elif pstree -p "$PID" | grep -q "($active_pid)"; then
+          is_target=1
+      fi
+      
+      if [[ "$is_target" == "1" ]]; then
+        # Should be running
+        if [[ "$(ps -o state= "$PID")" == T ]]; then
+           resumeProcess
+           if [ $SILENT -ne 1 ]; then sendNotification; fi
+        fi
+      else
+        # Should be stopped
+        if [[ "$(ps -o state= "$PID")" != T ]]; then
+           suspendProcess
+           if [ $SILENT -ne 1 ]; then sendNotification; fi
+        fi
+      fi
+    fi
+  done
 }
 
 function getPidByActive() {
@@ -138,6 +204,20 @@ function getPidByName() {
   debugPrint "PID by name: $PID"
 }
 
+function getPidByTitle() {
+  debugPrint "Getting PID by title regex: $1"
+  # Use jq to find the first window whose title matches the regex
+  # We select the 'pid' of the matching window
+  PID=$(hyprctl clients -j | jq -r --arg title "$1" '.[] | select(.title | test($title; "i")) | .pid' | head -n 1)
+  
+  debugPrint "PID by title: $PID"
+
+  if ! [[ $PID == ?(-)+([[:digit:]]) ]]; then
+    echo "No window found with title matching '$1'."
+    exit 1
+  fi
+}
+
 function getPidByProp() {
   debugPrint "Getting PID by prop..."
   if ! command -v hyprprop >/dev/null; then
@@ -166,8 +246,8 @@ function args() {
   local required_flag_count=0
 
   # Parse options
-  local options="hap:n:rst:"
-  local long_options="help,active,pid:,name:,prop,silent,notif-timeout:,dry-run,debug,no-xorg-workaround"
+  local options="hap:n:T:rst:w"
+  local long_options="help,active,pid:,name:,title:,prop,silent,notif-timeout:,dry-run,debug,no-xorg-workaround,watch"
   local parsed_args
   parsed_args=$(getopt -o "$options" --long "$long_options" -n "$(basename "$0")" -- "$@")
 
@@ -192,9 +272,17 @@ function args() {
         shift
         NAME_FLAG="$1"
         ;;
+      -T | --title)
+        ((required_flag_count++))
+        shift
+        TITLE_FLAG="$1"
+        ;;
       -r | --prop)
         ((required_flag_count++))
         FLAG_PROP=true
+        ;;
+      -w | --watch)
+        WATCH_MODE=1
         ;;
       -s | --silent)
         SILENT=1
@@ -239,17 +327,37 @@ function main() {
     getPidByPid "$FLAG_PID"
   elif [ -n "$NAME_FLAG" ]; then
     getPidByName "$NAME_FLAG"
+  elif [ -n "$TITLE_FLAG" ]; then
+    getPidByTitle "$TITLE_FLAG"
   elif [ "$FLAG_PROP" = true ]; then
     getPidByProp
   fi
 
-  # Suspend or resume process
-  toggleFreeze
+  if [ "$WATCH_MODE" -eq 1 ]; then
+    watchFreeze
+  else
+    # Suspend or resume process
+    toggleFreeze
 
-  # Send notification if not silent
-  if [ $SILENT -ne 1 ]; then sendNotification; fi
+    # Send notification if not silent
+    if [ $SILENT -ne 1 ]; then sendNotification; fi
+  fi
 
   debugPrint "End of main function."
+}
+
+function listen_socket() {
+  if ! command -v socat >/dev/null; then
+    echo "Error: 'socat' is required for watch mode. Please install it."
+    exit 1
+  fi
+
+  local socket_path="/tmp/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+  if [[ -n "$XDG_RUNTIME_DIR" ]] && [[ -S "$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" ]]; then
+    socket_path="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+  fi
+
+  socat -U - "UNIX-CONNECT:$socket_path"
 }
 
 SILENT=0
@@ -257,6 +365,7 @@ NOTIF_TIMEOUT=5000
 DRYRUN=0
 DEBUG=0
 NO_XORG_WORKAROUND=0
+WATCH_MODE=0
 
 args "$@"
 
